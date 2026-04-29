@@ -1,11 +1,19 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, Response
 import yt_dlp
 import os
 import tempfile
+import shutil
 
 app = Flask(__name__)
 
-# 健康检查
+# 允许 Vercel 跨域
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    return response
+
 @app.route('/')
 def health():
     return jsonify({'status': 'ok', 'service': 'yt-dlp-backend'})
@@ -30,10 +38,6 @@ def analyze():
             formats = []
             seen_qualities = set()
 
-            # 优先合一格式（视频+音频一体，无需合并）
-            progressive_formats = []
-            dash_formats = []
-
             for f in info.get('formats', []):
                 has_video = f.get('vcodec') != 'none'
                 has_audio = f.get('acodec') != 'none'
@@ -50,22 +54,19 @@ def analyze():
                 filesize = f.get('filesize') or f.get('filesize_approx')
                 size_str = f"~{filesize // 1024 // 1024}MB" if filesize else "~Unknown"
 
-                fmt = {
+                # 标记是否合一格式
+                is_progressive = has_video and has_audio and f.get('protocol') in ['https', 'http']
+
+                formats.append({
                     'formatId': f['format_id'],
                     'quality': f"{quality}p" if isinstance(quality, int) else str(quality),
                     'mimeType': f"video/{f.get('ext', 'mp4')}" if has_video else f"audio/{f.get('ext', 'mp3')}",
                     'hasAudio': has_audio,
-                    'fileSizeApprox': size_str
-                }
+                    'fileSizeApprox': size_str,
+                    'isProgressive': is_progressive
+                })
 
-                # 合一格式（progressive）：同时有视频和音频，且是https直链
-                if has_video and has_audio and f.get('protocol') in ['https', 'http']:
-                    progressive_formats.append(fmt)
-                else:
-                    dash_formats.append(fmt)
-
-            # 优先展示合一格式（用户可直接下载MP4），再展示DASH格式
-            formats = progressive_formats[:4] + dash_formats[:4]
+            formats = formats[:8]
 
             extractor = info.get('extractor', 'unknown')
             platform_map = {
@@ -100,51 +101,66 @@ def download():
     if not url or not format_id:
         return jsonify({'error': 'Missing URL or formatId'}), 400
 
+    temp_dir = None
     try:
-        # 策略1：优先尝试合一格式（22=720p, 18=360p）
-        # 策略2：如果用户选的格式是DASH，尝试用yt-dlp下载并合并
+        temp_dir = tempfile.mkdtemp()
+        output_template = os.path.join(temp_dir, 'video.%(ext)s')
 
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
             'format': format_id,
+            'outtmpl': output_template,
+            'merge_output_format': 'mp4',
+            # 限制只下载视频和音频，不下载字幕等
+            'writesubtitles': False,
+            'writeautomaticsub': False,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            ydl.download([url])
 
-            # 找到对应格式
-            format_info = next((f for f in info['formats'] if f['format_id'] == format_id), None)
-            if not format_info:
-                return jsonify({'error': 'Format not found'}), 404
+        # 找到生成的 mp4 文件
+        files = os.listdir(temp_dir)
+        mp4_files = [f for f in files if f.endswith('.mp4')]
 
-            # 如果是合一格式（有视频有音频，且是https/http），直接返回直链
-            has_video = format_info.get('vcodec') != 'none'
-            has_audio = format_info.get('acodec') != 'none'
-            is_progressive = has_video and has_audio and format_info.get('protocol') in ['https', 'http']
+        if not mp4_files:
+            return jsonify({'error': 'Download failed: no MP4 generated'}), 500
 
-            if is_progressive:
-                direct_url = format_info.get('url')
-                ext = format_info.get('ext', 'mp4')
-                return jsonify({
-                    'success': True,
-                    'directUrl': direct_url,
-                    'filename': f"{info.get('title', 'video').replace(' ', '_')}.{ext}",
-                    'contentType': 'video/mp4',
-                    'platform': info.get('extractor', 'unknown'),
-                    'isProgressive': True
-                })
+        file_path = os.path.join(temp_dir, mp4_files[0])
+        file_size = os.path.getsize(file_path)
 
-            # 如果是DASH格式（视频音频分离），需要下载合并
-            # 由于Railway免费版限制，这里返回提示，建议用户选择720p或360p格式
+        # 如果文件太大（>50MB），直接返回错误（Railway免费版内存不够）
+        if file_size > 50 * 1024 * 1024:
             return jsonify({
-                'success': False,
-                'error': 'This format requires server-side merging (DASH stream). Please select 720p or 360p format for direct MP4 download.',
-                'suggestedFormats': ['22', '18']
-            }), 400
+                'error': 'File too large for free tier. Please select a lower resolution (144p/240p).'
+            }), 413
+
+        # 读取文件并返回
+        with open(file_path, 'rb') as f:
+            file_data = f.read()
+
+        # 清理临时目录
+        shutil.rmtree(temp_dir)
+        temp_dir = None
+
+        safe_title = info.get('title', 'video').replace(' ', '_').replace('/', '_')[:50]
+        filename = f"{safe_title}.mp4"
+
+        return Response(
+            file_data,
+            mimetype='video/mp4',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Content-Length': str(file_size)
+            }
+        )
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        return jsonify({'error': f'Download/Merge failed: {str(e)}'}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
