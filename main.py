@@ -29,6 +29,13 @@ def analyze():
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
+        # 使用 Android 客户端降低被识别概率
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android'],
+                'player_skip': ['webpage', 'configs', 'js'],
+            }
+        },
     }
 
     try:
@@ -66,7 +73,8 @@ def analyze():
                     'isProgressive': is_progressive
                 })
 
-            formats = formats[:8]
+            # 限制返回数量
+            formats = formats[:10]
 
             extractor = info.get('extractor', 'unknown')
             platform_map = {
@@ -112,9 +120,14 @@ def download():
             'format': format_id,
             'outtmpl': output_template,
             'merge_output_format': 'mp4',
-            # 限制只下载视频和音频，不下载字幕等
             'writesubtitles': False,
             'writeautomaticsub': False,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android'],
+                    'player_skip': ['webpage', 'configs', 'js'],
+                }
+            },
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -131,7 +144,7 @@ def download():
         file_path = os.path.join(temp_dir, mp4_files[0])
         file_size = os.path.getsize(file_path)
 
-        # 如果文件太大（>50MB），直接返回错误（Railway免费版内存不够）
+        # 如果文件太大（>50MB），直接返回错误
         if file_size > 50 * 1024 * 1024:
             return jsonify({
                 'error': 'File too large for free tier. Please select a lower resolution (144p/240p).'
